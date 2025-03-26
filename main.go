@@ -15,6 +15,8 @@ import (
 var (
 	bot *tgbotapi.BotAPI
 	activeTimers = make(map[int64]*time.Timer)
+	timerActions = make(map[int64]string) // Track whether it's a shutdown or restart timer
+	pendingTimers = make(map[int64]bool)  // Track users who have initiated a timer command
 	adminChatID int64 = 2081422788
 )
 
@@ -135,42 +137,114 @@ _• Check current active timer_`)
 			continue
 		}
 
-		// Handle regular messages
-		if !update.Message.IsCommand() {
-			continue
+		// Handle pending timer input
+		if update.Message != nil && !update.Message.IsCommand() {
+			if _, pending := pendingTimers[update.Message.From.ID]; pending {
+				handleTimerInput(update.Message)
+				continue
+			}
 		}
 
-		msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
-		msg.ParseMode = "MarkdownV2"
+		// Handle regular messages
+		if update.Message != nil && update.Message.IsCommand() {
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "")
+			msg.ParseMode = "MarkdownV2"
 
-		switch update.Message.Command() {
-		case "shutdown":
-			msg.Text = "⏹️ *Shutting down PC\\.\\.\\.*"
-			bot.Send(msg)
-			go shutdownPC()
-		case "restart":
-			msg.Text = "🔄 *Restarting PC\\.\\.\\.*"
-			bot.Send(msg)
-			go restartPC()
-		case "shutdown_timer":
-			msg.Text = "⏰ *Set Shutdown Timer*\n\n_Please specify the time in format:_\n`1s` _for seconds_\n`1m` _for minutes_\n`1h` _for hours_"
-			bot.Send(msg)
-		case "restart_timer":
-			msg.Text = "⏰ *Set Restart Timer*\n\n_Please specify the time in format:_\n`1s` _for seconds_\n`1m` _for minutes_\n`1h` _for hours_"
-			bot.Send(msg)
-		case "get_current_timer":
-			msg.Text = getCurrentTimer(update.Message.From.ID)
-			bot.Send(msg)
-		case "cancel_timer":
-			msg.Text = cancelTimer(update.Message.From.ID)
-			bot.Send(msg)
-		case "capture_screen":
-			handleScreenCapture(update.Message)
-		case "stats":
-			msg.Text = getSystemStats()
-			bot.Send(msg)
+			switch update.Message.Command() {
+			case "shutdown":
+				msg.Text = "⏹️ *Shutting down PC\\.\\.\\.*"
+				bot.Send(msg)
+				go shutdownPC()
+			case "restart":
+				msg.Text = "🔄 *Restarting PC\\.\\.\\.*"
+				bot.Send(msg)
+				go restartPC()
+			case "shutdown_timer":
+				msg.Text = "⏰ *Set Shutdown Timer*\n\n_Please specify the time in format:_\n`1s` _for seconds_\n`1m` _for minutes_\n`1h` _for hours_"
+				bot.Send(msg)
+				// Mark user as waiting for timer input
+				pendingTimers[update.Message.From.ID] = true
+				timerActions[update.Message.From.ID] = "shutdown"
+			case "restart_timer":
+				msg.Text = "⏰ *Set Restart Timer*\n\n_Please specify the time in format:_\n`1s` _for seconds_\n`1m` _for minutes_\n`1h` _for hours_"
+				bot.Send(msg)
+				// Mark user as waiting for timer input
+				pendingTimers[update.Message.From.ID] = true
+				timerActions[update.Message.From.ID] = "restart"
+			case "get_current_timer":
+				msg.Text = getCurrentTimer(update.Message.From.ID)
+				bot.Send(msg)
+			case "cancel_timer":
+				msg.Text = cancelTimer(update.Message.From.ID)
+				bot.Send(msg)
+			case "capture_screen":
+				handleScreenCapture(update.Message)
+			case "stats":
+				msg.Text = getSystemStats()
+				bot.Send(msg)
+			}
 		}
 	}
+}
+
+func handleTimerInput(message *tgbotapi.Message) {
+	// Clear pending status
+	delete(pendingTimers, message.From.ID)
+	
+	// Parse the time input
+	duration, err := parseTime(message.Text)
+	if err != nil {
+		errorMsg := err.Error()
+		for _, char := range []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"} {
+			errorMsg = strings.ReplaceAll(errorMsg, char, "\\"+char)
+		}
+		msg := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("❌ *Invalid time format*\n\n_Error: %s_", errorMsg))
+		msg.ParseMode = "MarkdownV2"
+		bot.Send(msg)
+		return
+	}
+
+	// Cancel any existing timer
+	if timer, exists := activeTimers[message.From.ID]; exists {
+		timer.Stop()
+	}
+
+	// Get the action (shutdown or restart)
+	action := timerActions[message.From.ID]
+	
+	// Create response message
+	var actionText string
+	if action == "shutdown" {
+		actionText = "shutdown"
+	} else {
+		actionText = "restart"
+	}
+	
+	msg := tgbotapi.NewMessage(message.Chat.ID, 
+		fmt.Sprintf("⏰ *Timer set*\n\nPC will %s in `%s`", actionText, duration.String()))
+	msg.ParseMode = "MarkdownV2"
+	bot.Send(msg)
+
+	// Set the new timer
+	timer := time.AfterFunc(duration, func() {
+		notifyMsg := tgbotapi.NewMessage(message.Chat.ID, 
+			fmt.Sprintf("⏰ *Timer completed\\!*\n\nExecuting %s now\\.\\.\\.", actionText))
+		notifyMsg.ParseMode = "MarkdownV2"
+		bot.Send(notifyMsg)
+		
+		// Execute the action
+		if action == "shutdown" {
+			shutdownPC()
+		} else {
+			restartPC()
+		}
+		
+		// Remove from active timers
+		delete(activeTimers, message.From.ID)
+	})
+	
+	// Store the timer
+	activeTimers[message.From.ID] = timer
 }
 
 func getCurrentTimer(userID int64) string {
@@ -178,7 +252,13 @@ func getCurrentTimer(userID int64) string {
 	if !exists {
 		return "ℹ️ *No active timer*"
 	}
-	return fmt.Sprintf("⏰ *Active timer:*\n`%v`", timer)
+	
+	action := "unknown"
+	if act, exists := timerActions[userID]; exists {
+		action = act
+	}
+	
+	return fmt.Sprintf("⏰ *Active %s timer running*", action)
 }
 
 func cancelTimer(userID int64) string {
@@ -188,6 +268,7 @@ func cancelTimer(userID int64) string {
 	}
 	timer.Stop()
 	delete(activeTimers, userID)
+	delete(timerActions, userID)
 	return "✅ *Timer cancelled successfully*"
 }
 
